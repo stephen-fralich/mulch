@@ -1,0 +1,461 @@
+#!/usr/bin/perl
+#
+#
+#
+
+use File::Path qw(make_path remove_tree);
+use File::Basename qw(dirname);
+use Getopt::Std;
+use Sys::Syslog;
+
+my $mulch_data = '/usr/local/mulch';
+my $createrepo_bin = 'createrepo_c';
+my $repoquery_bin = 'repoquery';
+my $createrepo_workers = 8;
+
+##########################################################################
+
+my $mulch_masters = "$mulch_data/masters";
+my $mulch_clones = "$mulch_data/clones";
+my $mulch_confs = "$mulch_data/confs";
+my $mulch_lists = "$mulch_data/lists";
+my $yum_cache_dir = "$mulch_data/yumdirs/cache";
+my $yum_persist_dir = "$mulch_data/yumdirs/persist";
+
+my $action = '';
+my $mulch_master = '';
+my $mulch_clone = '';
+my $mulch_master_source = '';
+my $verbose = 0;
+my $duplicates = 0;
+my $raw_diff = 0;
+
+getopts('s:w:a:m:c:k:l:t:vdunrqf');
+if($opt_a) { $action = $opt_a; }
+if($opt_m) { $mulch_master = $opt_m; }
+if($opt_c) { $mulch_clone = $opt_c; }
+if($opt_d) { $duplicates = 1; }
+if($opt_v) { $verbose = 1; }
+if($opt_w) { $createrepo_workers = $opt_w; }
+if($opt_s) { $mulch_master_source = $opt_s; }
+if($opt_k) { $rhel_client_key = $opt_k; }
+if($opt_l) { $rhel_client_cert = $opt_l; }
+if($opt_t) { $rhel_ca_cert = $opt_t; }
+
+openlog('mulch','','user');
+
+my $mulch_clone_list = "$mulch_lists/mulchclone-$mulch_clone.list";
+my $mulch_master_repo_file = "$mulch_confs/mulchmaster-$mulch_master.repo";
+my $mulch_master_source_repo_file = "$mulch_confs/mulchmastersource-$mulch_master.repo";
+my $mulch_clone_repo_file = "$mulch_confs/mulchclone-$mulch_clone.repo";
+my $mulch_clone_source_repo_file = "$mulch_confs/mulchclonesource-$mulch_clone.repo";
+my $mulch_master_repoid = "mulchmaster-$mulch_master";
+my $mulch_master_source_repoid = "mulchmastersource-$mulch_master";
+my $mulch_clone_repoid = "mulchclone-$mulch_clone";
+my $mulch_clone_repo_dir = "$mulch_clones/$mulch_clone";
+my $mulch_master_repo_dir = "$mulch_masters/$mulch_master";
+
+### Create a clone from a master
+if($action eq 'create' && $mulch_clone ne '' && $mulch_master ne '' && $mulch_master_source eq '') {
+  my %mulch_clone_list_h = read_clone_list($mulch_clone_list);
+  my %mulch_master_repo_h = read_repo_files($mulch_master_repo_file,$mulch_master_repoid);
+  my %mulch_clone_repo_h = ();
+  my @mulch_clone_links_a = gen_links_to_clone(\%mulch_clone_list_h,\%mulch_master_repo_h,\%mulch_clone_repo_h);
+  create_clone_links($mulch_master_repo_dir,$mulch_clone_repo_dir,@mulch_clone_links_a);
+  createrepo($mulch_clone_repo_dir);
+  create_repo_file($mulch_clone_repo_file,$mulch_clone_repoid,"file://$mulch_clone_repo_dir");
+  my $link_good = link $mulch_master_repo_file, $mulch_clone_source_repo_file;
+  if(! $link_good) { fatal("ERROR: Could not create link for clone's repo source, $mulch_master_repo_file -> $mulch_clone_source_repo_file: $!"); }
+  syslog(LOG_INFO, "Created clone repo $mulch_clone with master repo $mulch_master as source.");
+### Update a clone from a master
+} elsif($action eq 'update' && $mulch_clone ne '' && $mulch_master eq '') {
+  my ($mulch_master_repoid,$mulch_master_repo_uri) = get_master($mulch_clone_source_repo_file);
+  my($uri,$mulch_master_repo_path) = split(/:\/\//, $mulch_master_repo_uri);
+  if($uri ne 'file') { fatal("ERROR: only file:// type URI is valid."); }
+  my %mulch_master_repo_h = read_repo_files($mulch_clone_source_repo_file,$mulch_master_repoid);
+  my %mulch_clone_list_h = read_clone_list($mulch_clone_list);
+  my %mulch_clone_repo_h = read_repo_files($mulch_clone_repo_file,$mulch_clone_repoid);
+  my @mulch_clone_links_a = gen_links_to_clone(\%mulch_clone_list_h,\%mulch_master_repo_h,\%mulch_clone_repo_h);
+  if(scalar(@mulch_clone_links_a) > 0) {
+    create_clone_links($mulch_master_repo_path,$mulch_clone_repo_dir,@mulch_clone_links_a);
+    createrepo($mulch_clone_repo_dir);
+    syslog(LOG_INFO, "Ran update on clone repo $mulch_clone with master repo $mulch_master_repoid as source.");
+  } else {
+    print "No packages to clone.\n";
+  }
+### Delete a clone
+} elsif($action eq 'delete' && $mulch_clone ne '' && $mulch_master eq '') {
+  delete_repo($mulch_clone,$mulch_clone_source_repo_file,$mulch_clone_repo_file,$mulch_clone_repo_dir);
+### Update a master repo from its source
+} elsif($action eq 'update' && $mulch_master ne '' && $mulch_clone eq '') {
+  reposync($mulch_master_source_repo_file,$mulch_master_repo_dir,$mulch_master_source_repoid,$mulch_master);
+  createrepo($mulch_master_repo_dir);
+  syslog(LOG_INFO, "Ran update on master repo $mulch_master.");
+### Delete a master repo
+} elsif($action eq 'delete' && $mulch_master ne '' && $mulch_clone eq '') {
+  delete_repo($mulch_master,$mulch_master_source_repo_file,$mulch_master_repo_file,$mulch_master_repo_dir);
+### Create a master from a source URL
+} elsif($action eq 'create' && $mulch_master ne '' && $mulch_clone eq '' && $mulch_master_source ne '') {
+  if($rhel_client_key || $rhel_client_cert || $rhel_ca_cert) {
+    if(! ($rhel_client_key && $rhel_client_cert && $rhel_ca_cert)) {
+      die "If any of -l <arg>, -k <arg>, and -t <arg> provided, all must be.\n";
+    }
+  }
+  create_repo_file($mulch_master_repo_file,$mulch_master_repoid,"file://$mulch_master_repo_dir");
+  if($mulch_master_source ne 'local' && ! $rhel_client_key && ! $rhel_client_cert && ! $rhel_ca_cert) {
+    create_repo_file($mulch_master_source_repo_file,$mulch_master_source_repoid,$mulch_master_source);
+    reposync($mulch_master_source_repo_file,$mulch_master_repo_dir,$mulch_master_source_repoid);
+  } elsif($mulch_master_source ne 'local' && $rhel_client_key && $rhel_client_cert && $rhel_ca_cert) {
+    create_repo_file($mulch_master_source_repo_file,$mulch_master_source_repoid,$mulch_master_source,$rhel_client_key,$rhel_client_cert,$rhel_ca_cert);
+    reposync($mulch_master_source_repo_file,$mulch_master_repo_dir,$mulch_master_source_repoid);
+  }
+  createrepo($mulch_master_repo_dir);
+  syslog(LOG_INFO, "Created master repo $mulch_master from $mulch_master_source");
+### List the packages in a repo
+} elsif($action eq 'list' && ($mulch_master ne '' || $mulch_clone ne '')) {
+  my $list_repo_file = '';
+  my $list_repoid = '';
+  if($mulch_master ne '') { $list_repo_file = $mulch_master_repo_file; $list_repoid = $mulch_master_repoid; }
+  else { $list_repo_file = $mulch_clone_repo_file; $list_repoid = $mulch_clone_repoid; }
+  if($duplicates) {
+    system("repoquery -c $list_repo_file --repoid=$list_repoid --qf \"%{name}-%{ver}-%{release}\" -a --show-duplicates");
+  } else {
+    system("repoquery -c $list_repo_file --repoid=$list_repoid --qf \"%{name}-%{ver}-%{release}\" -a");
+  }
+### Diff a master or a clone to its source
+} elsif($action eq 'diff' && ($mulch_master ne '' || $mulch_clone ne '') && ($opt_u || $opt_n || $opt_r)) {
+  my $working_repo_dir = '';
+  my $working_repo_file = '';
+  if($mulch_master ne '') { $working_repo_dir = $mulch_master_repo_dir; $working_repo_file = $mulch_master_source_repo_file; }
+  else { $working_repo_dir = $mulch_clone_repo_dir; $working_repo_file = $mulch_clone_source_repo_file; }
+  my ($source_repoid,$source_repo_uri) = get_master($working_repo_file);
+  my $source_type = get_type($working_repo_file);
+  if($source_type == 1) { die "RHN/RH Satellite Repos, diff not supported\n"; }
+  my @output = `repodiff --old=file://$working_repo_dir --new=$source_repo_uri --archlist x86_64 --simple`;
+  my $rd_rc = $?;
+  if($rd_rc != 0) {
+    print "Error Output:\n@output\n";
+    fatal("repodiff --old=file://$working_repo_dir --new=$source_repo_uri --archlist x86_64 --simple exited $rd_rc");
+  }
+  if($opt_r) {
+    print "@output\n";
+  } else {
+    for (@output) {
+      chomp;
+      if($opt_u) {
+        my($package) = /^[\w\.-]+:\s+[\w\.-]+\s+->\s+([\w\.-]+).*/;
+        if($package) { print "$package\n"; }
+      }
+      if($opt_n) {
+        my($package) = /^New package:\s+([\w\.-]+).*/;
+        if($package) { print "$package\n"; }
+      }
+    }
+  }
+### List all the repos
+} elsif($action eq 'listrepos') {
+  opendir(my $conf_dir_fh, $mulch_confs) ||
+    fatal("ERROR: can't open mulch conf dir, $mulch_confs: $!");
+  print "Type    Name                  Source\n";
+  print "------  --------------------  ------------------------------\n";
+  format =
+@<<<<<<  @<<<<<<<<<<<<<<<<<<<<<<<<<<  @<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+.
+  foreach my $node (sort readdir($conf_dir_fh)) {
+    if($node =~ /mulch[master,clone]+-.+\.repo/) {
+      my(@node_parts) = split(/\-/, $node);
+      $node_parts[0] = $node_parts[0].'source';
+      my $source_repo_file = join('-', @node_parts);
+      my $source_repoid = '';
+      my $source_repo_uri = '';
+      my($type,$name) = $node =~ /mulch([master,clone]+)[source]*-([A-Za-z0-9\-]+)\.repo/;
+      if(-e "$mulch_confs/$source_repo_file") {
+        ($source_repoid,$source_repo_uri) = get_master("$mulch_confs/$source_repo_file");
+      }
+      if($type eq 'clone') {
+        
+        $root_source = substr $source_repoid, 12;
+      } elsif($type eq 'master') {
+        $root_source = $source_repo_uri;
+      }
+      format =
+@<<<<<< @<<<<<<<<<<<<<<<<<<<  @<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+$type,   $name,                       $root_source
+.
+      write;
+    }
+  }
+  closedir($conf_dir_fh);
+} else {
+  help();
+}
+
+closelog();
+
+###### SUBS ######
+
+sub help {
+  if($action eq 'create') {
+    print "mulch -a create -c <CLONE REPO NAME> -m <MASTER REPO NAME>\n";
+    print "mulch -a create -m <MASTER REPO NAME> -s <SOURCE URL>\n";
+    print "mulch -a create -m <MASTER REPO NAME> -s local\n";
+    print "mulch -a create -m <MASTER REPO NAME> -s <RHN SOURCE URL> \\ \n";
+    print "  -k <SSLCLIENTKEY> -l <SSLCLIENTCERT> -t <SSLCACERT>\n";
+  } elsif($action eq 'update') {
+    print "mulch -a update -c <CLONE REPO NAME> [-q]\n";
+    print "mulch -a update -m <MASTER REPO NAME> [-q]\n";
+    print "  -q  quiet: supress non-error output\n";
+  } elsif($action eq 'list') {
+    print "mulch -a list -c <CLONE REPO NAME> [-a]\n";
+    print "mulch -a list -m <MASTER REPO NAME> [-a]\n";
+    print "    -a  list all packages, including old versions\n";
+  } elsif($action eq 'diff') {
+    print "mulch -a diff -c <CLONE REPO NAME> [-n] [-u] [-n -u] [-r]\n";
+    print "mulch -a diff -m <MASTER REPO NAME> [-n] [-u] [-n -u] [-r]\n";
+    print "  -n     show only new packages\n";
+    print "  -u     show only updated packages\n";
+    print "  -n -u  show both new and updated packages\n";
+    print "  -r     show raw repodiff output\n";
+  } elsif($action eq 'delete') {
+    print "mulch -a delete -c <CLONE REPO NAME> [-f]\n";
+    print "mulch -a delete -m <MASTER REPO NAME> [-f]\n";
+    print "  -f  perform no checks, just try to remove everything\n";
+  } else {
+    print "mulch -a <ACTION>\n";
+    print "    ACTIONS: create, update, list, diff, listrepos, delete\n\n";
+    print "Running mulch with an action, but no other arguments will provide help.\n";
+  }
+  exit 1;
+}
+
+# Return details about a clone's master
+sub get_master {
+  my $clone_repo_file = shift;
+  my $repo_id = '';
+  my $repo_url = '';
+  open(my $clone_repo_fh, $clone_repo_file) ||
+    fatal("ERROR: can't read clone's source repo file, $clone_repo_file: $!");
+  while(<$clone_repo_fh>) {
+    chomp;
+    my($key,$data) = split(/=/);
+    if($key eq 'name') { $repo_id = $data; }
+    if($key eq 'baseurl') { $repo_url = $data; }
+  }
+  close($clone_repo_fh);
+  if(! $repo_id || ! $repo_url) { fatal("ERROR: cannot find master repo's name and baseurl from repo file, $clone_repo_file."); }
+  return ($repo_id,$repo_url);
+}
+
+sub get_type {
+  my $clone_repo_file = shift;
+  my $repo_id = '';
+  my $repo_url = '';
+  open(my $clone_repo_fh, $clone_repo_file) ||
+    fatal("ERROR: can't read clone's source repo file, $clone_repo_file: $!");
+  while(<$clone_repo_fh>) {
+    chomp;
+    my($key,$data) = split(/=/);
+    if($key eq 'sslclientcert') { return 1; }
+  }
+  close $clone_repo_fh;
+  return 0;
+}
+
+
+# Compare repo packages and generate a list of links to create
+sub gen_links_to_clone {
+  my($clone_list_h_ref,$master_repo_h_ref,$clone_repo_h_ref) = @_;
+  my %clone_list_h = %$clone_list_h_ref;
+  my %master_repo_h = %$master_repo_h_ref;
+  my %clone_repo_h = %$clone_repo_h_ref;
+  my @links_a = ();
+  my $packs_to_add = 0;
+  foreach my $package (keys %clone_list_h) {
+    if(exists $master_repo_h{$package} && ! exists $clone_repo_h{$package}) {
+      push @links_a, @{$master_repo_h{$package}};
+      $packs_to_add++;
+    } elsif(! exists $master_repo_h{$package}) { 
+      warn "WARNING: $package could not be found in master repo!\n";
+    }
+  }
+  if($verbose) { print STDERR "INFO: $packs_to_add packages to add, ".scalar(@links_a)." links to create\n"; }
+  return @links_a;
+}
+
+# Actually create the links from the master repo to the clone repo
+sub create_clone_links {
+  my ($master_path,$clone_path,@links_a) = @_;
+  foreach my $link (@links_a) {
+    my $clone_dir = dirname("$clone_path/$link");
+    if(! -d $clone_dir) {
+      make_path($clone_dir) ||
+        fatal("ERROR: can't create clone repo directory, $clone_dir: $!");
+    }
+    my $link_good = link "$master_path/$link", "$clone_path/$link";
+    if(! $link_good) { fatal("ERROR: Could not create link, $master_path/$link -> $clone_path/$link: $!"); }
+    if($verbose) { print "DEBUG: link $master_path/$link -> $clone_path/$link\n"; }
+  }
+}
+
+# Read a clone's package list and put it into a hash
+sub read_clone_list {
+  my $clone_list = shift;
+  my %clone_list_h = ();
+  open(my $clone_list_fh, $clone_list) ||
+    fatal("Can't read clone package list, $clone_list: $!");
+  while(<$clone_list_fh>) {
+    chomp;
+    $clone_list_h{$_} = undef;
+  }
+  close($clone_list_fh);
+  return %clone_list_h;
+}
+
+# List all the packages in a repo in the proper format to work with other tools
+sub read_repo_files {
+  my ($repo_file,$repo) = @_;
+  my %repo_files_h = ();
+  my @output = `$repoquery_bin -c $repo_file --repoid=$repo --qf \"%{name}-%{ver}-%{release}\t%{relativepath}\" -a --show-duplicates`;
+  my $rq_rc = $?;
+  if($rq_rc != 0) {
+    if(! $opt_q) {
+      print "Error Output:\n@output\n";
+    }
+    fatal("$repoquery_bin -c $repo_file --repoid=$repo ... exited $?");
+  }
+  foreach my $line (@output) {
+    chomp $line;
+    my($package,$file) = split(/\t/, $line);
+    push @{$repo_files_h{$package}}, $file;
+  }
+  return %repo_files_h;
+}
+
+sub createrepo {
+  my $repo_dir = shift;
+  my $cr_rc = 0;
+  my @output = ();
+  if($opt_q) {
+    @output = `$createrepo_bin --workers=$createrepo_workers $repo_dir 2>&1`;
+    $cr_rc = $?;
+  } else {
+    system("$createrepo_bin --workers=$createrepo_workers $repo_dir");
+    $cr_rc = $?;
+  }
+  if($cr_rc != 0) {
+    if(! $opt_q) {
+      print "Error Output:\n@output\n";
+    }
+    fatal("$createrepo_bin --workers=$createrepo_workers $repo_dir exited $cr_rc");
+  }
+}
+
+# Run repodiff so we can log the differences in the repos, then run reposync
+sub reposync {
+  my($repo_file,$repo_dir,$repo_id,$dest_repo_name) = @_;
+  $working_repo_dir = $mulch_master_repo_dir;
+  $working_repo_file = $mulch_master_source_repo_file;
+  my($source_repoid,$source_repo_uri) = get_master($working_repo_file);
+  my $source_repo_type = get_type($working_repo_file);
+  if($source_repo_type == 0) {
+    my @rd_output = `repodiff --old=file://$working_repo_dir --new=$source_repo_uri --archlist x86_64 --simple`;
+    my $rd_rc = $?;
+    if($rd_rc != 0) {
+      print "Error Output:\n@rd_output\n";
+      syslog(LOG_INFO, "repodiff --old=file://$working_repo_dir --new=$source_repo_uri --archlist x86_64 --simple exited $rd_rc");
+    }
+    for (@rd_output) {
+      chomp;
+      my($u_package) = /^[\w\.-]+:\s+[\w\.-]+\s+->\s+([\w\.-]+).*/;
+      if($u_package) { syslog(LOG_INFO, "Updated package $u_package available for $mulch_master"); }
+      my($n_package) = /^New package:\s+([\w\.-]+).*/;
+      if($n_package) { syslog(LOG_INFO, "New package $n_package available for $mulch_master"); }
+    }
+  } else {
+    syslog(LOG_INFO, "$dest_repo_name type RHN/RH Satellite not supported by repodiff, logging changes skipped");
+  }
+  my $rs_rc = 0;
+  my @output = ();
+  if($opt_q) {
+    @output = `reposync -c $repo_file -p $repo_dir -r $repo_id --norepopath 2>&1`;
+    $rs_rc = $?;
+  } else {
+    system("reposync -c $repo_file -p $repo_dir -r $repo_id --norepopath");
+    $rs_rc = $?;
+  }
+  if($rs_rc != 0) {
+    if($opt_q) {
+      print "Error Output:\n@output\n";
+    }
+    fatal("reposync -c $repo_file -p $repo_dir -r $repo_id exited $rs_rc");
+  }
+}
+
+sub create_repo_file {
+  my($repo_file,$repoid,$master_base_url,$rhel_client_key,$rhel_client_cert,$rhel_ca_cert) = @_;
+  open(my $repo_fh, ">", $repo_file) ||
+    fatal("can't write $repo_file: $!");
+  print $repo_fh "#####\n";
+  print $repo_fh "##### DO NOT REMOVE OR EDIT THIS FILE. IT WAS CREATED BY MULCH.\n";
+  print $repo_fh "#####\n";
+  print $repo_fh "[main]\n";
+  print $repo_fh "reposdir=/dev/null\n";
+  print $repo_fh "cachedir=$yum_cache_dir\n";
+  print $repo_fh "persistdir=$yum_persist_dir\n";
+  print $repo_fh "keepcache=0\n";
+  print $repo_fh "metadata_expire=0\n";
+  print $repo_fh "plugins=0\n";
+  print $repo_fh "[$repoid]\n";
+  print $repo_fh "name=$repoid\n";
+  print $repo_fh "baseurl=".$master_base_url."\n";
+  print $repo_fh "enabled=1\n";
+  if($rhel_client_key && $rhel_client_cert && $rhel_ca_cert) {
+    print $repo_fh "sslclientcert=$rhel_client_cert\n";
+    print $repo_fh "sslclientkey=$rhel_client_key\n";
+    print $repo_fh "sslcacert=$rhel_ca_cert\n";
+  }
+  close($repo_fh);
+}
+
+sub delete_repo {
+  my($my_repo,$source_repo_file,$my_repo_file,$my_repo_dir) = @_;
+  if((-e $source_repo_file && $my_repo_file && -d $my_repo_dir) || $opt_f) {
+    system("yum -c $source_repo_file clean all");
+    system("yum -c $my_repo_file clean all");
+    unlink_ck($source_repo_file);
+    unlink_ck($my_repo_file);
+    rmtree_ck($my_repo_dir);
+    syslog(LOG_INFO, "Deleted repo $mulch_clone");
+  } else {
+    fatal("Repo $my_repo not found.");
+  }
+}
+
+sub fatal {
+  my $msg = shift;
+  syslog(LOG_CRIT, $msg);
+  die "$msg\n";
+}
+
+sub unlink_ck {
+  my $file = shift;
+  my $unlink_ct = unlink $file;
+  if($unlink_ct != 1) {
+    warn "Remove $file failed: $!\n";
+  }
+}
+
+sub rmtree_ck {
+  my $dir = shift;
+  remove_tree( $dir, {error => \my $err} );
+  if (@$err) {
+    for my $diag (@$err) {
+      my ($file, $message) = %$diag;
+      if ($file eq '') {
+        warn "general error: $message\n";
+      } else {
+        warn "problem unlinking $file: $message\n";
+      }
+    }
+  }
+}
